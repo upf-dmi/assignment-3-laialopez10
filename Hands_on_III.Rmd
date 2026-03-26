@@ -1,7 +1,7 @@
 ---
-title: "my title"
-author: "Dummy Surname (dummy@mail.com)"
-date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+title: "Hands-on 3"
+author: "Laia López (laia.lopez10@estudiant.upf.edu)"
+date: "Last update: `15/03/2026`"      
 output:
   html_document:
     toc: true
@@ -12,6 +12,103 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+
+```{r chunk1, load_libraries, echo=TRUE, message=FALSE, warning=FALSE}
+if (!require("caret")){install.packages("caret"); require(caret)} 
+if (!require("randomForest")){install.packages("randomForest"); require(randomForest)}
+if (!require("pROC")){install.packages("pROC"); require(pROC)}
+if (!require("recipes")){install.packages("recipes"); require(recipes)}
+
+### Load required packages
+library(readxl)
+library(caret)
+library(recipes)
+library(randomForest)
+library(pROC)
+library(dplyr)
+library(ggplot2)
+
+### Read the data
+df_metadata <- readxl::read_xlsx("Data/Raw_Data/Table-S1.Additional-Demographical-and-Baseline-Characteristics-of-COVID-19-Patients-and-Control-Groups.xlsx", sheet = 2)
+
+# Rename important columns
+df_metadata <- df_metadata %>%
+  rename(
+    Patient_ID = `Patient ID a`,
+    Group = `Group d`
+  )
+
+# Create variable severity (2-3)
+df_metadata <- df_metadata %>%
+  mutate(
+    Patient_ID = trimws(as.character(Patient_ID)),
+    Group = as.numeric(Group)
+  ) %>%
+  filter(Group %in% c(2,3)) %>%
+  mutate(
+    Severity = case_when(
+      Group == 2 ~ "Non-severe",
+      Group == 3 ~ "Severe"
+    ),
+    Severity = factor(Severity, 
+                      levels = c("Non-severe","Severe"))
+  ) %>%
+  select(Patient_ID, Severity)
+
+```
+
+
+```{r chunk2, load_libraries, echo=TRUE, message=FALSE, warning=FALSE}
+# In the paper they used 18 non-severe and 13 severe patients for training data
+
+df_proteins <- readxl::read_xlsx("Data/Raw_Data/S3-Protein_and_Metabolite_Matrix.xlsx", sheet = 2, skip = 1)
+
+# Clean IDs
+df_proteins$...1 <- trimws(as.character(df_proteins$...1))
+
+# Remove descriptive columns
+df_proteins_clean <- df_proteins[, -c(1:2)]
+rownames(df_proteins_clean) <- df_proteins$...1
+
+# Transpose the matrix
+training_data <-  as.data.frame(t(df_proteins_clean))
+rownames(training_data) <- make.names(rownames(training_data), unique = TRUE)
+
+# Confirm ID match
+common_ids <- intersect(df_metadata$Patient_ID, rownames(training_data))
+df_metadata <- df_metadata %>% filter(Patient_ID %in% common_ids)
+training_data <- training_data[match(df_metadata$Patient_ID, rownames(training_data)), , drop = FALSE]  
+
+# Add Patient_ID as column
+training_data <- tibble::rownames_to_column(training_data, var = "Patient_ID")
+
+# Merge metadata with protein data
+df_model <- inner_join(df_metadata, training_data, by = "Patient_ID")
+rownames(df_model) <- df_model$Patient_ID
+df_model <- df_model[,-1]
+
+#Pre-processing from the study:
+# compounds with over 80% missing ratios in a particular patient group were removed for the metabolomics dataset
+#Metabolites and therapeutic compounds with over 80% missing ratios in a particular patient group were removed
+#Missing values were imputed with the minimal value and zero in metabolomics and proteomics dataset respectively.
+
+#Cols in our df
+outcome_col <- 1
+protein_cols <- 2:792
+metab_cols   <- 793:1639
+
+df_model[, protein_cols] <- lapply(df_model[, protein_cols], function(x) as.numeric(as.character(x)))
+
+df_model <- df_model %>%
+  select(-all_of(metab_cols))
+
+#Proteins missing values, 0 imputation
+df_model[, protein_cols] <- lapply(df_model[, protein_cols], function(x) {
+  x[is.na(x)] <- 0
+  x
+})
+
+```
 # Exercise 1
 
 **Build a Random Forest model to classify COVID-19 severity**
@@ -26,9 +123,106 @@ Report the following performance metrics from cross-validation:
 
 How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?
 
-```{r}
+```{r chunk3, load_libraries, echo=TRUE, message=FALSE, warning=FALSE, fig.align='center', results='hide'}
+# In the paper they used 18 non-severe and 13 severe patients for training data
+
+# Before train the model (because caret convert the class names to column names when it calculates probabilities)
+df_model$Severity <- as.character(df_model$Severity)
+
+df_model$Severity[df_model$Severity == "Non-severe"] <- "Non.severe"
+
+df_model$Severity <- factor(df_model$Severity,
+                            levels = c("Non.severe", "Severe"))
+
+# Model configuration
+set.seed(123)
+rf_recipe <- recipe(Severity ~ ., data = df_model)
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE, # necessary for ROC
+  summaryFunction = twoClassSummary, # calculate ROC, Sens, Spec
+  savePredictions = "final"
+)
+
+p <- ncol(df_model) - 1 # Max numb of variables to try for RF, exclude classification
+mtry_grid <- data.frame( mtry = c(1, 2, floor(sqrt(p)), floor(p/3), p) )
+
+# Train of RF
+rf_model <- train(
+  rf_recipe,
+  data = df_model,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = mtry_grid,
+  ntree = 1000, #Number of trees built in the research
+  importance = TRUE,
+  metric = "ROC")
+
+
+rf_model
+plot(rf_model)
+
+# Save the file
+png("Data/Processed_Data/rf_model_plot.png", width = 800, height = 600)
+plot(rf_model)    
+invisible(dev.off())
+
+# Extract best CV predictions
+best_mtry <- rf_model$bestTune$mtry
+predictions <- rf_model$pred
+predictions <- predictions[predictions$mtry == best_mtry, ]
+
+
+# Confusion Matrix
+conf_mat <- confusionMatrix(
+  predictions$pred,
+  predictions$obs,
+  positive = "Severe"
+)
+conf_mat$table
+
+
+# Accuracy
+accuracy <- conf_mat$overall["Accuracy"]
+conf_mat$overall["Accuracy"]
+
+#ROC and AUC
+
+roc_obj <- roc(
+  predictions$obs,
+  predictions$Severe
+)
+
+auc_value <- auc(roc_obj)
+auc_value
+
+plot(
+  roc_obj,
+  print.auc = TRUE,
+  col = "blue",
+  main = "ROC Curve - Random Forest",
+  legacy.axes = TRUE,
+  xlab = "FPR (1 - Specificity)"
+)
+
+# Save the plot
+png("Data/Processed_Data/roc_curve.png", width = 800, height = 600)
+plot(
+  roc_obj,
+  print.auc = TRUE,
+  col = "blue",
+  main = "ROC Curve - Random Forest",
+  legacy.axes = TRUE,
+  xlab = "FPR (1 - Specificity)"
+)
+invisible(dev.off())
 
 ```
+
+- The model shows excellent discrimination between severe and non-severe COVID-19 patients based on proteomic profiles, suggesting that proteomic signatures strongly reflect disease severity. 
+We see that the best tune corresponds to the model including 28 proteomic values, this model has a 0.85 Sensibility and Specificity. Is able to identify Severe cases correctly in most of the cases, as it can be observed in the Confusion matrix. The quality of the model gets ratified by a high AUC value. 
+
 
 # Exercise 2
 
@@ -38,9 +232,47 @@ Using the trained Random Forest model from Exercise 1, identify the 25 most impo
 
 Compare your selected features to the proteins reported by the authors in Supplementary Table 5.
 
-```{r}
+```{r chunk4, load_libraries, echo=TRUE, message=FALSE, warning=FALSE, fig.align='center'}
+
+df2_proteins <- readxl::read_xlsx("Data/Raw_Data/S5-Protein_and_Metabolite_Matrix.xlsx", sheet = 2, skip = 1)
+
+# Variable importance
+var_imp <- varImp(rf_model, scale = TRUE)
+
+# Convert to data frame
+importance_df <- var_imp$importance
+importance_df$Protein <- rownames(importance_df)
+
+# Create Overall column as a mean of both classes 
+importance_df$Overall <- rowMeans(importance_df[, 1:2])
+
+# Sort by Overall
+importance_df <- importance_df %>%
+  arrange(desc(Overall))
+
+# Top 25
+top25_proteins <- importance_df[1:25, ] #Selecting the number of proteins used in the model
+
+# Compare with Supplementary Table 5 to know which coincide
+top25_proteins$Match <- ifelse(top25_proteins$Protein %in% df2_proteins[[1]], "Reported", "Not reported")
+
+top25_proteins
+
+top25 <- ggplot(top25_proteins, aes(x = reorder(Protein, Overall), y = Overall, fill = Match)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("Reported" = "#B6D9B6", "Not reported" = "#E0ABB4")) +
+  labs(title = "Top 25 proteins by RF importance", x = "Protein ID/Metabolite", y = "Importance")
+
+top25
+
+ggsave("Data/Processed_Data/top25.png", plot = top25, width = 15, height = 12, dpi = 300)
 
 ```
+
+- We can see that most of the features selected for our model match the ones selected in the author's model, except for: P01009, P05156, P33908, P02763, P35542, P04004, P01019. 
+Nevertheless, the original research includes the metabolic parameters in their study, as a result some variation is expected. 
+
 
 # Exercise 3
 
@@ -58,9 +290,154 @@ Your task is to:
 
 How does the model perform on the independent test cohort?
 
-```{r}
+```{r chunk5, load_libraries, echo=TRUE, message=FALSE, warning=FALSE, fig.align='center'}
+
+# Read the test data
+test_df <- readxl::read_xlsx("Data/Raw_Data/S4-Independent_Test_Cohort.xlsx", sheet = 2, skip = 1)
+
+# Clean Patient_ID
+test_df$...1 <- trimws(as.character(test_df$...1))
+
+# Remove descriptive columns
+test_clean <- test_df[, -c(1:2)]  
+rownames(test_clean) <- test_df$...1
+
+# Transpose the matrix
+test_data <- as.data.frame(t(test_clean))
+rownames(test_data) <- make.names(rownames(test_data), unique = TRUE)
+
+# Add Patient_ID
+test_data <- tibble::rownames_to_column(test_data, var = "Patient_ID")
+
+
+# Read the metadata
+df_test_metadata <- readxl::read_xlsx("Data/Raw_Data/Table-S1.Additional-Demographical-and-Baseline-Characteristics-of-COVID-19-Patients-and-Control-Groups.xlsx", sheet = 2)
+
+df_test_metadata <- df_test_metadata %>%
+  rename(
+    Patient_ID = `Patient ID a`,
+    Group = `Group d`
+  ) %>%
+  mutate(
+    Patient_ID = trimws(as.character(Patient_ID)),
+    Group = as.numeric(Group)
+  ) %>%
+  filter(Group %in% c(2,3)) %>%
+  mutate(
+  Severity = case_when(
+      Group == 2 ~ "Non.severe",
+      Group == 3 ~ "Severe"
+    ),
+    Severity = factor(Severity,
+                      levels = c("Non.severe","Severe"))
+  )
+
+
+# Join metadata with proteins
+df_test <- inner_join(df_test_metadata, test_data, by = "Patient_ID")
+
+rownames(df_test) <- df_test$Patient_ID
+df_test <- df_test[,-1]
+
+#Identify features common with training model
+common_features <- intersect(colnames(df_model)[-1], colnames(df_test))
+
+# Subset both datasets to common features
+df_model_reduced <- df_model[, c("Severity", common_features)]
+df_test_final <- df_test[, c("Severity", common_features)]
+
+# Convert to numeric and impute NA 
+df_test_final[, -1] <- lapply(df_test_final[, -1], function(x) as.numeric(as.character(x)))
+df_test_final[is.na(df_test_final)] <- 0
+
+
+# Train the model with reduced features
+set.seed(123)
+rf_recipe <- recipe(Severity ~ ., data = df_model_reduced)
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+p <- ncol(df_model_reduced) - 1
+mtry_grid <- data.frame(mtry = c(1,2,floor(sqrt(p)), floor(p/3), p))
+
+rf_model_reduced <- train(
+  rf_recipe,
+  data = df_model_reduced,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = mtry_grid,
+  ntree = 1000,
+  importance = TRUE,
+  metric = "ROC"
+)
+```
+
+- The Random Forest model was initially developed using the full training dataset. For external validation, only the features shared between the training and independent test cohorts were kept. As the test dataset did not contain all the feautres present in the training dataset, a final model was then re-trained on the training data using this reduced feature set to ensure compatibility with the test cohort.</b>
+
+
+
+```{r, load_libraries, echo=TRUE, message=FALSE, warning=FALSE, fig.align='center'}
+
+# Predict on test cohort
+test_probs <- predict(rf_model_reduced, df_test_final, type = "prob")
+test_pred  <- predict(rf_model_reduced, df_test_final)
+
+df_test_final$Predicted_Class <- test_pred
+df_test_final$Prob_Severe <- test_probs$Severe
+
+results_table <- data.frame(
+  Sample = rownames(df_test_final),
+  True_Severity = df_test_final$Severity,
+  Predicted_Class = df_test_final$Predicted_Class,
+  Prob_Severe = df_test_final$Prob_Severe
+)
+
+# Evaluate
+conf_mat_test <- confusionMatrix(
+  df_test_final$Predicted_Class,
+  df_test_final$Severity,
+  positive = "Severe"
+)
+
+accuracy_test <- conf_mat_test$overall["Accuracy"]
+
+roc_test <- roc(df_test_final$Severity, df_test_final$Prob_Severe)
+auc_test <- auc(roc_test)
+
+# Plot ROC
+plot(roc_test,
+     print.auc = TRUE,
+     col = "red",
+     main = "ROC Curve - External Test Cohort")
+
+# Save the plot
+png("Data/Processed_Data/ROC_test_EXT.png", width = 1200, height = 900)
+
+plot(roc_test,
+     print.auc = TRUE,
+     col = "red",
+     main = "ROC Curve - External Test Cohort")
+
+
+# Print results
+conf_mat_test
+accuracy_test
+auc_test
+
+cat("============ Predicted probabilties ============ ")
+results_table
 
 ```
+
+The model achieved an AUC of 0.792 on the independent test cohort, indicating good diagnostic/predictive performance.
+Although slightly lower than the performance observed in the training data, this decrease is expected and reflects a more realistic evaluation of the model’s generalization ability.
+Overall, the model demonstrates robust predictive capacity when applied to the test data.
+
 
 # session info {.unnumbered}
 
